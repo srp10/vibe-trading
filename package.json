@@ -1,0 +1,29 @@
+{
+  "name": "vibe-trading",
+  "version": "1.0.0",
+  "description": "> Transform your AI agent from a general \"vibe coding\" tool into a sophisticated \"vibe trading\" analyst by integrating real-time market data and advanced charting capabilities.",
+  "main": "runner.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/srp10/vibe-trading.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/srp10/vibe-trading/issues"
+  },
+  "homepage": "https://github.com/srp10/vibe-trading#readme",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.73.0",
+    "dotenv": "^17.2.4",
+    "marked": "^17.0.1",
+    "node-fetch": "^3.3.2",
+    "openai": "^6.18.0",
+    "puppeteer": "^24.37.2"
+  }
+}

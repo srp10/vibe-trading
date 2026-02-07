@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "chart-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@antv/mcp-server-chart"
+      ]
+    },
+    "fin-data-mcp": {
+      "httpUrl": "https://mcp.plusefin.com/mcp?apikey=XAWtF4UoWLs8WsBuNLtDBz"
+    }
+  }
+}
