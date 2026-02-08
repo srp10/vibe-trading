@@ -1,308 +1,425 @@
 "use strict";
 
 /*
- OpenAI Runner for Vibe Trading
- - Reads prompt.md
- - Loads MCP config from CONFIG_DIR/settings.json (defaults to .agent/settings.json)
- - Fetches optional ticker via --ticker flag
- - Calls OpenAI Chat Completions API using OPENAI_API_KEY
- - Provides hooks to call MCP servers (PlusE over HTTP, AntV Chart via npx) — minimal example included for PlusE
- - Outputs a markdown report to stdout
+ Vibe Trading Runner
+ - Fetches financial data via Yahoo Finance (no API key needed)
+ - Generates professional charts via QuickChart.io (no API key needed)
+ - Calls Claude (default) or OpenAI to generate equity research reports
+ - Outputs a markdown report with embedded charts + optional PDF
 
  Usage:
-   OPENAI_API_KEY=sk-... node runner.js --ticker CCJ
-   CONFIG_DIR=.agent OPENAI_API_KEY=sk-... node runner.js --ticker CCJ
-   node runner.js --ticker AAPL > Equity_Research_Report.md
+   node runner.js --ticker AAPL
    node runner.js --ticker AAPL --out reports/AAPL_Report.md
    node runner.js --ticker AAPL --out reports/AAPL_Report.md --pdf
-   node runner.js --ticker AAPL --provider claude
+   node runner.js --ticker AAPL --provider openai
 
  Requirements:
    - Node 18+ (recommended Node 20+)
-   - npm i openai dotenv node-fetch (we will import fetch from node >=18 global)
-   - For --pdf: npm i puppeteer marked
-   - For Claude: npm i @anthropic-ai/sdk
+   - npm install
 */
 
 const fs = require("fs");
 const path = require("path");
-const { spawn } = require("child_process");
-require("dotenv").config();
-// We will dynamically import OpenAI and Anthropic SDK when needed
+require("dotenv").config({ override: true });
 
-// Simple CLI arg parsing for --ticker
+const YahooFinance = require("yahoo-finance2").default;
+const QuickChart = require("quickchart-js");
+
+const yf = new YahooFinance({ suppressNotices: ["yahooSurvey"] });
+
+// ── CLI arg parsing ──────────────────────────────────────────────────
 const args = process.argv.slice(2);
-let ticker = null;
-for (let i = 0; i < args.length; i++) {
-  if (args[i] === "--ticker" && i + 1 < args.length) {
-    ticker = args[i + 1];
-  }
+
+function getArg(flag) {
+  const i = args.indexOf(flag);
+  return i !== -1 && i + 1 < args.length ? args[i + 1] : null;
 }
 
-let outPath = null;
-for (let i = 0; i < args.length; i++) {
-  if (args[i] === "--out" && i + 1 < args.length) {
-    outPath = args[i + 1];
-  }
-}
+const ticker = getArg("--ticker");
+let outPath = getArg("--out");
+const exportPdf = args.includes("--pdf");
+let provider = getArg("--provider") || process.env.PROVIDER || "claude";
 
-let exportPdf = false;
-for (let i = 0; i < args.length; i++) {
-  if (args[i] === "--pdf") {
-    exportPdf = true;
-  }
-}
-
-let provider = process.env.PROVIDER || null;
-for (let i = 0; i < args.length; i++) {
-  if (args[i] === "--provider" && i + 1 < args.length) {
-    provider = args[i + 1];
-  }
-}
-if (!provider) provider = "openai"; // default
-
+// ── Utility helpers ──────────────────────────────────────────────────
 function readFileOrThrow(p) {
   const abs = path.resolve(p);
-  if (!fs.existsSync(abs)) {
-    throw new Error(`File not found: ${abs}`);
-  }
+  if (!fs.existsSync(abs)) throw new Error(`File not found: ${abs}`);
   return fs.readFileSync(abs, "utf8");
 }
 
 function ensureDirSync(dir) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-function loadMcpConfig() {
-  const configDir = process.env.CONFIG_DIR || ".agent";
-  const configPath = path.resolve(configDir, "settings.json");
-  if (!fs.existsSync(configPath)) {
-    return null;
-  }
-  const raw = fs.readFileSync(configPath, "utf8");
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    throw new Error(`Failed to parse settings.json in configured directory: ${e.message}`);
-  }
+// ── Yahoo Finance data fetching ──────────────────────────────────────
+async function fetchAllData(symbol) {
+  console.error(`Fetching data for ${symbol} from Yahoo Finance...`);
+
+  const [summary, priceData] = await Promise.all([
+    yf.quoteSummary(symbol, {
+      modules: [
+        "price", "summaryDetail", "financialData", "defaultKeyStatistics",
+        "earnings", "earningsHistory", "earningsTrend",
+        "incomeStatementHistory", "incomeStatementHistoryQuarterly",
+        "balanceSheetHistory", "cashflowStatementHistory",
+        "recommendationTrend", "upgradeDowngradeHistory", "assetProfile"
+      ]
+    }),
+    yf.chart(symbol, {
+      period1: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000),
+      interval: "1wk"
+    })
+  ]);
+
+  console.error(`Data fetched: ${priceData.quotes.length} price points, ` +
+    `${summary.earnings?.earningsChart?.quarterly?.length || 0} earnings quarters`);
+
+  return { summary, priceData };
 }
 
-// Helper to invoke MCP HTTP endpoints with a tool and args
-// Tool names are placeholders and should be updated per PlusE docs once available.
-async function mcpInvoke(httpUrl, tool, args = {}) {
-  if (!httpUrl) return null;
-  try {
-    const res = await fetch(httpUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tool, args })
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      return { error: `MCP invoke failed: ${res.status} ${text}` };
-    }
-    return await res.json();
-  } catch (e) {
-    return { error: `MCP invoke error: ${e.message}` };
-  }
+// ── QuickChart generation ────────────────────────────────────────────
+const CHART_COLORS = {
+  green: "#10b981",
+  blue: "#3b82f6",
+  red: "#ef4444",
+  gray: "#6b7280",
+  orange: "#f59e0b",
+  purple: "#8b5cf6",
+  teal: "#14b8a6",
+  gridLine: "rgba(0,0,0,0.08)",
+};
+
+function makeChartUrl(config) {
+  const chart = new QuickChart();
+  chart.setConfig(config);
+  chart.setWidth(750);
+  chart.setHeight(420);
+  chart.setBackgroundColor("#ffffff");
+  chart.setVersion("4");
+  return chart.getUrl();
 }
 
-async function fetchPlusE(mcpConfig, symbol) {
-  if (!mcpConfig || !mcpConfig.mcpServers || !mcpConfig.mcpServers["fin-data-mcp"]) return null;
-  const srv = mcpConfig.mcpServers["fin-data-mcp"]; 
-  const httpUrl = srv.httpUrl;
-  if (!httpUrl) return null;
-  return await mcpInvoke(httpUrl, "get_ticker_data", { ticker: symbol });
-}
+function buildEarningsChart(ticker, earningsQuarterly) {
+  if (!earningsQuarterly || earningsQuarterly.length === 0) return null;
 
-async function fetchHistoricalSeries(mcpConfig, symbol, period = "1y") {
-  if (!mcpConfig || !mcpConfig.mcpServers || !mcpConfig.mcpServers["fin-data-mcp"]) return null;
-  const srv = mcpConfig.mcpServers["fin-data-mcp"]; 
-  const httpUrl = srv.httpUrl;
-  if (!httpUrl) return null;
-  // No explicit historical price series tool provided yet; leave charts placeholder.
-  // Fetch financial statements as additional context instead.
-  const stmt = await mcpInvoke(httpUrl, "get_financial_statements", { ticker: symbol, statement_type: "income", frequency: "quarterly" });
-  return { series: null, financials: stmt };
-}
+  const labels = earningsQuarterly.map(e => e.date || e.calendarQuarter || "Q");
+  const actuals = earningsQuarterly.map(e => e.actual ?? 0);
+  const estimates = earningsQuarterly.map(e => e.estimate ?? 0);
 
-async function fetchEarningsHistory(mcpConfig, symbol) {
-  if (!mcpConfig || !mcpConfig.mcpServers || !mcpConfig.mcpServers["fin-data-mcp"]) return null;
-  const srv = mcpConfig.mcpServers["fin-data-mcp"]; 
-  const httpUrl = srv.httpUrl;
-  if (!httpUrl) return null;
-  return await mcpInvoke(httpUrl, "get_earnings_history", { ticker: symbol });
-}
-
-async function generateChartViaMcp(mcpConfig, spec) {
-  // Expect chart-mcp to be configured with command and args
-  if (!mcpConfig || !mcpConfig.mcpServers || !mcpConfig.mcpServers["chart-mcp"]) return null;
-  const srv = mcpConfig.mcpServers["chart-mcp"];
-  const cmd = srv.command;
-  const args = Array.isArray(srv.args) ? srv.args : [];
-
-  return new Promise((resolve) => {
-    const proc = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-
-    proc.stdout.on("data", (d) => { stdout += d.toString(); });
-    proc.stderr.on("data", (d) => { stderr += d.toString(); });
-
-    proc.on("error", () => resolve(null));
-
-    proc.on("close", () => {
-      // Try to parse stdout as JSON or detect a data URL
-      try {
-        const trimmed = stdout.trim();
-        if (trimmed.startsWith("data:image")) {
-          resolve({ dataUrl: trimmed });
-          return;
+  return makeChartUrl({
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        {
+          label: "Actual EPS",
+          data: actuals,
+          backgroundColor: CHART_COLORS.green,
+          borderRadius: 4,
+        },
+        {
+          label: "Estimate EPS",
+          data: estimates,
+          backgroundColor: CHART_COLORS.blue,
+          borderRadius: 4,
         }
-        const json = JSON.parse(trimmed);
-        resolve(json);
-      } catch {
-        resolve(null);
+      ]
+    },
+    options: {
+      plugins: {
+        title: { display: true, text: `${ticker} — Earnings Per Share (Actual vs Estimate)`, font: { size: 16, weight: "bold" } },
+        legend: { position: "bottom" }
+      },
+      scales: {
+        y: { title: { display: true, text: "EPS ($)" }, grid: { color: CHART_COLORS.gridLine } },
+        x: { grid: { display: false } }
       }
-    });
-
-    // Send a simple spec to stdin; adjust to actual chart-mcp protocol as needed
-    const payload = JSON.stringify({ action: "render", spec });
-    proc.stdin.write(payload);
-    proc.stdin.end();
+    }
   });
 }
 
+function buildRevenueChart(ticker, incomeStatements) {
+  if (!incomeStatements || incomeStatements.length === 0) return null;
+
+  const data = [...incomeStatements].reverse();
+  const labels = data.map(s => {
+    const d = new Date(s.endDate);
+    return `${d.getFullYear()}-Q${Math.ceil((d.getMonth() + 1) / 3)}`;
+  });
+  const revenues = data.map(s => +(((s.totalRevenue || 0) / 1e9).toFixed(1)));
+  const netIncomes = data.map(s => +(((s.netIncome || 0) / 1e9).toFixed(1)));
+
+  return makeChartUrl({
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        {
+          label: "Revenue ($B)",
+          data: revenues,
+          backgroundColor: CHART_COLORS.blue,
+          borderRadius: 4,
+        },
+        {
+          label: "Net Income ($B)",
+          data: netIncomes,
+          backgroundColor: CHART_COLORS.green,
+          borderRadius: 4,
+        }
+      ]
+    },
+    options: {
+      plugins: {
+        title: { display: true, text: `${ticker} — Quarterly Revenue & Net Income`, font: { size: 16, weight: "bold" } },
+        legend: { position: "bottom" }
+      },
+      scales: {
+        y: { title: { display: true, text: "USD (Billions)" }, grid: { color: CHART_COLORS.gridLine } },
+        x: { grid: { display: false } }
+      }
+    }
+  });
+}
+
+function buildPriceChart(ticker, quotes) {
+  if (!quotes || quotes.length === 0) return null;
+
+  const labels = quotes.map(q => {
+    const d = new Date(q.date);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  });
+  const closes = quotes.map(q => +(q.close?.toFixed(2) ?? 0));
+
+  return makeChartUrl({
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        label: `${ticker} Close Price`,
+        data: closes,
+        borderColor: CHART_COLORS.blue,
+        backgroundColor: "rgba(59,130,246,0.08)",
+        fill: true,
+        pointRadius: 0,
+        borderWidth: 2.5,
+        tension: 0.3,
+      }]
+    },
+    options: {
+      plugins: {
+        title: { display: true, text: `${ticker} — 1-Year Price History`, font: { size: 16, weight: "bold" } },
+        legend: { display: false }
+      },
+      scales: {
+        y: { title: { display: true, text: "Price ($)" }, grid: { color: CHART_COLORS.gridLine } },
+        x: {
+          grid: { display: false },
+          ticks: { maxTicksLimit: 12 }
+        }
+      }
+    }
+  });
+}
+
+function buildAnalystChart(ticker, recommendationTrend) {
+  if (!recommendationTrend || !recommendationTrend.trend || recommendationTrend.trend.length === 0) return null;
+
+  const current = recommendationTrend.trend[0];
+  const labels = ["Strong Buy", "Buy", "Hold", "Sell", "Strong Sell"];
+  const data = [
+    current.strongBuy || 0,
+    current.buy || 0,
+    current.hold || 0,
+    current.sell || 0,
+    current.strongSell || 0
+  ];
+
+  return makeChartUrl({
+    type: "bar",
+    data: {
+      labels,
+      datasets: [{
+        label: "# of Analysts",
+        data,
+        backgroundColor: [
+          CHART_COLORS.green,
+          CHART_COLORS.teal,
+          CHART_COLORS.orange,
+          CHART_COLORS.red,
+          "#991b1b"
+        ],
+        borderRadius: 4,
+      }]
+    },
+    options: {
+      indexAxis: "y",
+      plugins: {
+        title: { display: true, text: `${ticker} — Analyst Recommendations`, font: { size: 16, weight: "bold" } },
+        legend: { display: false }
+      },
+      scales: {
+        x: { title: { display: true, text: "Number of Analysts" }, grid: { color: CHART_COLORS.gridLine } },
+        y: { grid: { display: false } }
+      }
+    }
+  });
+}
+
+function generateAllCharts(ticker, summary, priceData) {
+  const charts = [];
+
+  // 1. Price history chart
+  const priceUrl = buildPriceChart(ticker, priceData?.quotes);
+  if (priceUrl) charts.push({ alt: `${ticker} Price History`, url: priceUrl });
+
+  // 2. Earnings chart
+  const earningsUrl = buildEarningsChart(ticker, summary?.earnings?.earningsChart?.quarterly);
+  if (earningsUrl) charts.push({ alt: `${ticker} Earnings`, url: earningsUrl });
+
+  // 3. Revenue & net income chart
+  const revenueUrl = buildRevenueChart(ticker,
+    summary?.incomeStatementHistoryQuarterly?.incomeStatementHistory);
+  if (revenueUrl) charts.push({ alt: `${ticker} Revenue`, url: revenueUrl });
+
+  // 4. Analyst recommendations
+  const analystUrl = buildAnalystChart(ticker, summary?.recommendationTrend);
+  if (analystUrl) charts.push({ alt: `${ticker} Analyst Ratings`, url: analystUrl });
+
+  console.error(`Generated ${charts.length} charts`);
+  return charts;
+}
+
+// ── PDF export ───────────────────────────────────────────────────────
 async function markdownToPdf(markdown, pdfPath) {
-  // Lazy import to avoid requiring puppeteer unless needed
-  const { marked } = await import('marked');
-  const puppeteer = await import('puppeteer');
+  const { marked } = await import("marked");
+  const puppeteer = await import("puppeteer");
 
   const html = `<!doctype html><html><head><meta charset="utf-8"><title>Report</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; padding: 24px; }
-    pre, code { background: #f6f8fa; }
-    img { max-width: 100%; }
-    h1,h2,h3 { margin-top: 1.2em; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; padding: 32px; color: #1a1a1a; line-height: 1.6; }
+    h1 { border-bottom: 2px solid #3b82f6; padding-bottom: 8px; }
+    h2 { color: #1e40af; margin-top: 1.5em; }
+    h3 { color: #374151; }
+    pre, code { background: #f1f5f9; border-radius: 4px; padding: 2px 6px; font-size: 0.9em; }
+    pre { padding: 12px; }
+    img { max-width: 100%; margin: 16px 0; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+    th, td { border: 1px solid #e5e7eb; padding: 8px 12px; text-align: left; }
+    th { background: #f8fafc; font-weight: 600; }
+    hr { border: none; border-top: 1px solid #e5e7eb; margin: 24px 0; }
   </style>
   </head><body>${marked.parse(markdown)}</body></html>`;
 
-  const browser = await puppeteer.launch({ headless: 'new' });
+  const browser = await puppeteer.launch({ headless: "new" });
   const page = await browser.newPage();
-  await page.setContent(html, { waitUntil: 'networkidle0' });
-  await page.pdf({ path: pdfPath, format: 'A4', printBackground: true });
+  await page.setContent(html, { waitUntil: "networkidle0" });
+  await page.pdf({ path: pdfPath, format: "A4", printBackground: true, margin: { top: "20mm", bottom: "20mm", left: "15mm", right: "15mm" } });
   await browser.close();
 }
 
+// ── AI model call ────────────────────────────────────────────────────
 async function sendToModel(provider, systemPreamble, userContent) {
-  if (provider === 'claude') {
-    const { default: Anthropic } = await import('@anthropic-ai/sdk');
+  if (provider === "claude") {
+    const { default: Anthropic } = await import("@anthropic-ai/sdk");
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    const model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
+    const model = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
     const resp = await anthropic.messages.create({
       model,
       max_tokens: 4000,
       system: systemPreamble,
-      messages: [
-        { role: 'user', content: userContent }
-      ]
+      messages: [{ role: "user", content: userContent }]
     });
-    const content = resp?.content?.[0]?.text || '';
-    return content;
+    return resp?.content?.[0]?.text || "";
   } else {
-    const { OpenAI } = require('openai');
+    const { OpenAI } = require("openai");
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
     const response = await client.chat.completions.create({
       model,
       messages: [
-        { role: 'system', content: systemPreamble },
-        { role: 'user', content: userContent }
+        { role: "system", content: systemPreamble },
+        { role: "user", content: userContent }
       ],
       temperature: 0.3
     });
-    return response.choices?.[0]?.message?.content || '';
+    return response.choices?.[0]?.message?.content || "";
   }
 }
 
+// ── Main ─────────────────────────────────────────────────────────────
 async function main() {
-  if (provider === 'openai') {
-    if (!process.env.OPENAI_API_KEY) {
-      console.error('Missing OPENAI_API_KEY. Set it in .env or export it.');
-      process.exit(1);
-    }
-  } else if (provider === 'claude') {
-    if (!process.env.ANTHROPIC_API_KEY) {
-      console.error('Missing ANTHROPIC_API_KEY. Set it in .env or export it.');
-      process.exit(1);
-    }
+  // Validate API key
+  if (provider === "openai" && !process.env.OPENAI_API_KEY) {
+    console.error("Missing OPENAI_API_KEY. Set it in .env or export it.");
+    process.exit(1);
+  }
+  if (provider === "claude" && !process.env.ANTHROPIC_API_KEY) {
+    console.error("Missing ANTHROPIC_API_KEY. Set it in .env or export it.");
+    process.exit(1);
   }
 
   // Load prompt.md
-  const promptPath = path.resolve("prompt.md");
-  const prompt = readFileOrThrow(promptPath);
+  const prompt = readFileOrThrow(path.resolve("prompt.md"));
 
-  // Load MCP config
-  const mcpConfig = loadMcpConfig();
+  // Fetch financial data & generate charts
+  let summary = null;
+  let priceData = null;
+  let charts = [];
 
-  // Optionally fetch PlusE data and historical series for ticker
-  let plusEData = null;
-  let historical = null;
-  let earnings = null;
   if (ticker) {
-    plusEData = await fetchPlusE(mcpConfig, ticker);
-    historical = await fetchHistoricalSeries(mcpConfig, ticker, "1y");
-    earnings = await fetchEarningsHistory(mcpConfig, ticker);
+    const data = await fetchAllData(ticker);
+    summary = data.summary;
+    priceData = data.priceData;
+    charts = generateAllCharts(ticker, summary, priceData);
   }
 
-  // Attempt to generate a simple chart (using placeholder data as no historical price series tool yet)
-  // Once a historical price series tool name is available, we will render a real chart.
-  let chartImageMarkdown = "";
-  try {
-    const chartSpec = {
-      type: "line",
-      title: ticker ? `${ticker} Price (Sample)` : "Price (Sample)",
-      data: [
-        { x: 1, y: 10 },
-        { x: 2, y: 12 },
-        { x: 3, y: 9 },
-        { x: 4, y: 15 }
-      ]
-    };
-
-    const chartResult = await generateChartViaMcp(mcpConfig, chartSpec);
-    const dataUrl = chartResult && (chartResult.dataUrl || chartResult.url || chartResult.image);
-    if (dataUrl && typeof dataUrl === "string") {
-      chartImageMarkdown = `\n\n![Chart](${dataUrl})\n`;
+  // Build chart markdown section
+  let chartSection = "";
+  if (charts.length > 0) {
+    chartSection = "\n\n---\n\n## Charts\n\n";
+    for (const c of charts) {
+      chartSection += `![${c.alt}](${c.url})\n\n`;
     }
-  } catch {}
+  }
 
-  // Compose system and user messages
-  const systemPreamble = `You are a world-class equity research analyst. Only analyze the company specified by the Target Ticker in the user message. Ignore any example companies that may appear in the prompt body. Use the provided prompt as your workflow. If market data is provided from tools, incorporate it. When uncertain, state assumptions.`;
+  // Compose the AI prompt with financial data context
+  const systemPreamble = `You are a world-class equity research analyst. Only analyze the company specified by the Target Ticker. Ignore any example companies in the prompt. Use the provided prompt as your workflow. Incorporate the real market data provided. When uncertain, state assumptions clearly.`;
 
-  const toolContext = `Tool Context JSON (if any):\n${JSON.stringify({ ticker, overview: plusEData, financials: historical && historical.financials, earnings }, null, 2)}`;
+  // Prepare a condensed data summary for the model (avoid huge JSON)
+  const dataSummary = summary ? {
+    ticker,
+    price: summary.price,
+    financialData: summary.financialData,
+    defaultKeyStatistics: summary.defaultKeyStatistics,
+    summaryDetail: summary.summaryDetail,
+    earnings: summary.earnings,
+    earningsHistory: summary.earningsHistory,
+    recommendationTrend: summary.recommendationTrend,
+    upgradeDowngradeHistory: summary.upgradeDowngradeHistory?.history?.slice(0, 10),
+    incomeQuarterly: summary.incomeStatementHistoryQuarterly?.incomeStatementHistory,
+    assetProfile: summary.assetProfile ? {
+      sector: summary.assetProfile.sector,
+      industry: summary.assetProfile.industry,
+      fullTimeEmployees: summary.assetProfile.fullTimeEmployees,
+      longBusinessSummary: summary.assetProfile.longBusinessSummary
+    } : null
+  } : { ticker };
 
-  const userHeader = `Target Ticker: ${ticker ?? "(not specified)"}\n${toolContext}\n\n`;
-
-  const userContent = `${userHeader}${prompt}`;
+  const toolContext = `Financial Data (from Yahoo Finance):\n${JSON.stringify(dataSummary, null, 2)}`;
+  const userContent = `Target Ticker: ${ticker ?? "(not specified)"}\n\n${toolContext}\n\n${prompt}`;
 
   console.error(`Using provider: ${provider}`);
-
   const text = await sendToModel(provider, systemPreamble, userContent);
 
-  const finalMd = text + chartImageMarkdown + "\n";
+  const finalMd = text + chartSection + "\n";
 
-  // Determine output path: use --out if provided, else default to reports/<ticker or report>_<YYYY-MM-DD>.md
+  // Determine output path
   if (!outPath) {
     const reportsDir = path.resolve("reports");
     ensureDirSync(reportsDir);
-    const base = ticker ? `${ticker}_Report` : `Report`;
-    const dateStr = new Date().toISOString().slice(0,10);
-    outPath = path.join(reportsDir, `${base}_${dateStr}.md`);
+    const dateStr = new Date().toISOString().slice(0, 10);
+    outPath = path.join(reportsDir, `${ticker || "Report"}_Report_${dateStr}.md`);
   } else {
-    // Ensure parent directory exists
     ensureDirSync(path.dirname(path.resolve(outPath)));
   }
 
@@ -310,7 +427,7 @@ async function main() {
   console.error(`Report written to: ${outPath}`);
 
   if (exportPdf) {
-    const pdfPath = outPath.replace(/\.md$/i, '.pdf');
+    const pdfPath = outPath.replace(/\.md$/i, ".pdf");
     try {
       await markdownToPdf(finalMd, pdfPath);
       console.error(`PDF written to: ${pdfPath}`);
@@ -320,13 +437,7 @@ async function main() {
   }
 }
 
-// Ensure global fetch (Node >=18 has fetch)
-if (typeof fetch === "undefined") {
-  global.fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
-}
-
 main().catch(err => {
   console.error(err);
   process.exit(1);
 });
-
